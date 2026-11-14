@@ -1,29 +1,31 @@
 {% extends "base.html" %}
-{% block title %}对比结果 {{ run.run_id }} · {{ app_name }}{% endblock %}
+{% block title %}对比结果 {{ release.release_id }} · {{ app_name }}{% endblock %}
 {% block crumb %}对比结果{% endblock %}
-{% block meta %}{% set s = run.summary %}<span class="dot {{ 'err' if s.level == 'none' else ('warn' if s.level != 'full' else 'ok') }}"></span>兼容级别 {{ s.level }} · {{ '可执行' if s.can_execute else '有阻断不可执行' }}{% endblock %}
+{% block meta %}{% set s = run.summary %}<span class="dot {{ 'ok' if release.state == 'published' else ('err' if release.state in ('stale', 'failed') else 'warn') }}"></span>{{ release.state_label }} · 兼容级别 {{ s.level }}{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
-<a class="btn small" href="/api/runs/{{ run.run_id }}/migration.sql">下载迁移脚本</a>
+{% if release.downloadable %}<a class="btn small" href="/api/releases/{{ release.release_id }}/migration.sql">下载迁移脚本</a>{% endif %}
 {% endblock %}
-{% block status_left %}run_id {{ run.run_id }} · 生成于 {{ run.created_at }} · 输入来源 {{ run.source }} · 矩阵 {{ run.matrix_version }}{% endblock %}
-{% block status_right %}表 <code>{{ run.table }}</code> · {{ run.match.rows|length }} 条字段匹配 · {{ run.migration.sql_steps|length }} 条 ALTER{% endblock %}
+{% block status_left %}{{ release.release_id }} · v{{ release.version }} · 冻结于 {{ release.created_at }} · 指纹 {{ release.short_fingerprint }} · 矩阵 {{ release.frozen.rules.matrix_version }}{% endblock %}
+{% block status_right %}表 <code>{{ release.table }}</code> · {{ run.match.rows|length }} 条字段匹配 · {{ run.migration.sql_steps|length }} 条 ALTER{% endblock %}
 
 {% block content %}
 {% set s = run.summary %}
 <div class="page-head">
   <div>
-    <h1 class="page-title">对比结果 · <span class="mono">{{ run.run_id }}</span></h1>
+    <h1 class="page-title">对比结果 · <span class="mono">{{ release.release_id }}</span>
+      <span class="tag {{ release.state_tag }}" style="vertical-align:middle">{{ release.state_label }}</span>
+    </h1>
     <p class="page-sub">
-      表 <code>{{ run.table }}</code> · 生成于 {{ run.created_at }} · 输入来源 {{ run.source }} · 矩阵 {{ run.matrix_version }} ·
+      表 <code>{{ release.table }}</code> · 版本 <strong>v{{ release.version }}</strong> · 冻结于 {{ release.created_at }} · 输入来源 {{ release.source }} ·
+      指纹 <code>{{ release.short_fingerprint }}</code> · 矩阵 {{ release.frozen.rules.matrix_version }} ·
       兼容级别
       {% if s.level == 'full' %}<span class="tag ok">full</span>
       {% elif s.level == 'backward' %}<span class="tag warn">backward</span>
       {% elif s.level == 'forward' %}<span class="tag warn">forward</span>
       {% else %}<span class="tag err">none</span>{% endif %}
-      {{ s.level_label }} ·
-      能否执行迁移
-      {% if s.can_execute %}<span class="tag ok">是</span>{% else %}<span class="tag err">否（{{ s.migration_blocking }} 项迁移阻断）</span>{% endif %}
+      {{ s.level_label }}
+      {% if release.published_at %} · 发布于 {{ release.published_at }}{% endif %}
     </p>
   </div>
   <div class="page-head-actions">
@@ -31,6 +33,54 @@
     <a class="btn secondary small" href="/workbench?sample={{ 'C' if s.level == 'none' else 'B' }}">换一组再比</a>
   </div>
 </div>
+
+{% if release.state == 'preview' %}
+<div class="alert {% if publish_blockers %}alert-error{% else %}alert-info{% endif %}" role="alert" style="margin-bottom:12px">
+  <strong>这是预演，不是生效结论。</strong>本次规则、两版字段与读取方清单已冻结（指纹 <code>{{ release.short_fingerprint }}</code>），
+  回填与影响范围来自同一时刻的快照。
+  {% if publish_blockers %}
+    存在 {{ publish_blockers|length }} 项阻断，<strong>全部消除后才允许发布</strong>：
+    <ul class="list small" style="margin:4px 0 0">
+      {% for b in publish_blockers[:5] %}<li>{{ b.code }}{% if b.field %} · <code>{{ b.field }}</code>{% endif %} · {{ b.text }}</li>{% endfor %}
+      {% if publish_blockers|length > 5 %}<li>… 其余 {{ publish_blockers|length - 5 }} 项见「阻断与消费方」分段</li>{% endif %}
+    </ul>
+  {% else %}
+    阻断已全部消除，可一次性切换为当前生效版；切换失败会保留上一版。
+  {% endif %}
+  <div style="margin-top:8px">
+    {% if not publish_blockers %}
+    <button type="button" id="btn-publish" data-release="{{ release.release_id }}">发布为当前生效版（v{{ release.version }}）</button>
+    {% endif %}
+    <span class="small muted">相同冻结输入重试只会回到本版，不会新增版本。</span>
+  </div>
+  <div id="publish-error" class="alert alert-error" role="alert" style="margin-top:8px" hidden></div>
+</div>
+{% elif release.state == 'failed' %}
+<div class="alert alert-error" role="alert" style="margin-bottom:12px">
+  <strong>发布失败，上一版仍生效。</strong>{{ release.error }}
+  冻结输入未变，可用同一版本重试（第 {{ release.attempts }} 次尝试后失败），重试不新增版本。
+  <div style="margin-top:8px">
+    <button type="button" id="btn-publish" data-release="{{ release.release_id }}">重试发布 v{{ release.version }}</button>
+  </div>
+  <div id="publish-error" class="alert alert-error" role="alert" style="margin-top:8px" hidden></div>
+</div>
+{% elif release.state == 'stale' %}
+<div class="alert alert-error" role="alert" style="margin-bottom:12px">
+  <strong>旧方案已失效：规则（类型矩阵）已更新。</strong>本版按旧规则冻结（指纹 {{ release.short_fingerprint }}），
+  结论与脚本不可再作为执行方案；请回工作台按当前规则重新预演，会生成新版本。
+</div>
+{% elif release.state == 'superseded' %}
+<div class="alert alert-error" role="alert" style="margin-bottom:12px">
+  <strong>旧方案已失效：已被更新版本取代。</strong>本版（v{{ release.version }}）发布于 {{ release.published_at }}，
+  {% if release.current_release_id %}当前生效版为 <a href="/result/{{ release.current_release_id }}"><code>{{ release.current_release_id }}</code></a>{% endif %}。
+  结果页、历史与下载脚本都只认当前生效版。
+</div>
+{% else %}
+<div class="alert alert-info" role="alert" style="margin-bottom:12px">
+  <strong>当前生效版（v{{ release.version }}）。</strong>结果页、历史与下载脚本指向同一版；
+  规则或读取方清单变化后本版会自动失效，需重新预演发布。
+</div>
+{% endif %}
 
 <div class="kpi-strip">
   <div class="kpi">
@@ -71,7 +121,11 @@
     <div class="panel-actions">
       <span class="tag">{{ run.type_changes|length }} 条类型变更</span>
       <span class="tag {{ 'err' if s.level == 'none' else ('warn' if s.level != 'full' else 'ok') }}">{{ s.level }}</span>
-      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/migration.sql">下载脚本</a>
+      {% if release.downloadable %}
+      <a class="btn secondary small" href="/api/releases/{{ release.release_id }}/migration.sql">下载脚本</a>
+      {% else %}
+      <span class="tag err" title="只有当前生效版可下载脚本">脚本未生效</span>
+      {% endif %}
     </div>
   </div>
 
@@ -197,10 +251,16 @@
       </div>
 
       <div class="panel-body tight">
+        {% if release.downloadable %}
         <p class="small" style="margin:0 0 6px">
-          迁移 SQL 可整体下载：<a href="/api/runs/{{ run.run_id }}/migration.sql">/api/runs/{{ run.run_id }}/migration.sql</a>
+          迁移 SQL 可整体下载：<a href="/api/releases/{{ release.release_id }}/migration.sql">/api/releases/{{ release.release_id }}/migration.sql</a>
           · 顺序固定：改名 → 加列（含默认值）→ 回填 → 类型变更 → 删列最后；阻断项不产出 ALTER。
         </p>
+        {% else %}
+        <p class="small" style="margin:0 0 6px">
+          以下为冻结快照中的预演 SQL，<strong>仅当前生效版可下载为可执行脚本</strong>；本版状态：{{ release.state_label }}。
+        </p>
+        {% endif %}
         <pre class="sql" id="sql-block">{{ run.migration.sql_text }}</pre>
       </div>
 
@@ -356,10 +416,12 @@
     </div>
   </div>
   <div class="panel-actions">
-    <a class="btn small" href="/api/runs/{{ run.run_id }}/migration.sql">下载迁移脚本</a>
+    {% if release.downloadable %}
+    <a class="btn small" href="/api/releases/{{ release.release_id }}/migration.sql">下载迁移脚本</a>
+    {% endif %}
     <a class="btn secondary small" href="/workbench">回工作台再跑一次</a>
     <a class="btn secondary small" href="/review">复核与导出（历史对比）</a>
-    <span class="small muted" style="align-self:center">run_id <code>{{ run.run_id }}</code> · 同一输入重跑会生成新记录</span>
+    <span class="small muted" style="align-self:center">{{ release.release_id }} · v{{ release.version }} · 相同冻结输入重试回到本版，不新增版本</span>
   </div>
 </div>
 {% endblock %}

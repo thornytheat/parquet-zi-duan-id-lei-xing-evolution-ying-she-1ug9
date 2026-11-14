@@ -1,14 +1,16 @@
-"""FastAPI 路由（薄）：页面渲染 + 少量 JSON API，核心规则全部在纯函数模块。"""
-from __future__ import annotations
+"""FastAPI 路由（薄）：页面渲染 + 少量 JSON API，核心规则全部在纯函数模块。
 
-import json
+受控发布流程：预演（POST /api/releases/preview，同指纹幂等）→
+阻断全部消除 → 发布（POST /api/releases/{id}/publish，原子切换当前版）。
+"""
+from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import report, schemaio, settings, store
+from . import control, release as rel, report, schemaio, settings, store
 from .schemaio import SchemaError
 from .types import DECIMAL_RULES, matrix_table
 
@@ -23,15 +25,29 @@ def _ctx(request: Request, active: str, **extra) -> dict:
     return ctx
 
 
-def _index_stats(sample_count: int, history: list[dict]) -> dict:
-    """总览页只读统计：全部从既有运行记录派生，不改动任何业务判定。"""
-    steps = [int(r.get("summary", {}).get("sql_steps") or 0) for r in history]
+def _view(release: dict) -> dict:
+    """release + 派生状态（按读取时刻的 current 指针与规则摘要计算）。"""
+    return rel.release_view(release, store.load_current(), rel.current_rules_digest())
+
+
+def _release_or_404(release_id: str):
+    try:
+        return store.load_release(release_id)
+    except KeyError:
+        return None
+
+
+def _index_stats(sample_count: int, releases: list[dict], current: dict) -> dict:
+    """总览页只读统计：全部从既有发布记录派生，不改动任何业务判定。"""
+    steps = [int(r.get("result", {}).get("summary", {}).get("sql_steps") or 0) for r in releases]
+    summaries = [r.get("result", {}).get("summary", {}) for r in releases]
     return {
         "sample_count": sample_count,
-        "run_count": len(history),
-        "full_count": sum(1 for r in history if r.get("summary", {}).get("level") == "full"),
-        "backfill_count": sum(1 for r in history if int(r.get("summary", {}).get("backfill_count") or 0) > 0),
-        "breaking_count": sum(1 for r in history if not r.get("summary", {}).get("can_execute", True)),
+        "release_count": len(releases),
+        "published_count": len(current),
+        "full_count": sum(1 for s in summaries if s.get("level") == "full"),
+        "backfill_count": sum(1 for s in summaries if int(s.get("backfill_count") or 0) > 0),
+        "breaking_count": sum(1 for s in summaries if not s.get("can_execute", True)),
         "avg_steps": round(sum(steps) / len(steps), 1) if steps else 0.0,
     }
 
@@ -49,6 +65,13 @@ def _resolve_inputs(payload: dict) -> tuple[dict, dict, dict, str]:
     return old, new, consumers, "自定义输入"
 
 
+def _check_consistent(old: dict, new: dict, consumers: dict) -> None:
+    if old["table"] != new["table"]:
+        raise SchemaError(f"新旧 schema 的表名不一致：{old['table']} vs {new['table']}")
+    if consumers.get("table") and consumers["table"] != new["table"]:
+        raise SchemaError(f"数据文件清单的表名 {consumers['table']} 与新 schema {new['table']} 不一致")
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "app": "schemaevo", "matrix_version": settings.MATRIX_VERSION}
@@ -57,15 +80,17 @@ async def health() -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     samples = schemaio.load_sample_index()
-    history = store.list_runs(limit=50)
+    current = store.load_current()
+    releases = store.list_releases(limit=50)
+    views = [_view(r) for r in releases]
     return templates.TemplateResponse(
         request, "index.html",
         _ctx(
             request, "/",
             page="index",
             samples=samples,
-            recent=history[:3],
-            stats=_index_stats(len(samples), history),
+            recent=views[:3],
+            stats=_index_stats(len(samples), releases, current),
         ),
     )
 
@@ -76,7 +101,7 @@ async def workbench(request: Request):
     if key not in settings.SAMPLE_KEYS:
         key = "A"
     sample = schemaio.load_sample(key)
-    # 右侧面板「预演」：复用既有纯函数算一遍所选样例，不落库、不改接口。
+    # 右侧面板「即时预演」：复用既有纯函数算一遍所选样例，不落库、不产生版本。
     preview = report.build_run(sample["old"], sample["new"], sample["consumers"], f"样例 {key}")
     return templates.TemplateResponse(
         request, "workbench.html",
@@ -94,27 +119,102 @@ async def workbench(request: Request):
     )
 
 
-@app.post("/api/compare")
-async def api_compare(request: Request):
+@app.post("/api/releases/preview")
+async def api_preview(request: Request):
+    """预演：冻结规则 + 两版字段 + 读取方清单，生成（或复用）一个 release。
+
+    相同冻结输入重试返回同一 release（created=false），不新增版本。
+    """
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse({"detail": "请求体必须是 JSON，且 Content-Type 为 application/json"}, status_code=400)
     try:
         old, new, consumers, source = _resolve_inputs(payload)
-        if old["table"] != new["table"]:
-            raise SchemaError(f"新旧 schema 的表名不一致：{old['table']} vs {new['table']}")
-        if consumers.get("table") and consumers["table"] != new["table"]:
-            raise SchemaError(f"数据文件清单的表名 {consumers['table']} 与新 schema {new['table']} 不一致")
-        run = report.build_run(old, new, consumers, source)
-        run = store.save_run(run)
+        _check_consistent(old, new, consumers)
+        release, created = control.preview_release(old, new, consumers, source)
     except SchemaError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=400)
+    view = _view(release)
     return {
-        "run_id": run["run_id"],
-        "summary": run["summary"],
-        "redirect": f"/result/{run['run_id']}",
+        "release_id": view["release_id"],
+        "version": view["version"],
+        "state": view["state"],
+        "state_label": view["state_label"],
+        "fingerprint": view["fingerprint"],
+        "created": created,
+        "summary": view["result"]["summary"],
+        "redirect": f"/result/{view['release_id']}",
     }
+
+
+@app.post("/api/releases/{release_id}/publish")
+async def api_publish(release_id: str):
+    """发布：阻断全部消除后，把当前版指针一次性切到该 release；失败保留上一版。"""
+    try:
+        release = control.publish_release(release_id)
+    except KeyError:
+        return JSONResponse({"detail": f"发布记录 {release_id} 不存在"}, status_code=404)
+    except rel.ReleaseError as exc:
+        body = {"detail": exc.detail, **exc.extra}
+        return JSONResponse(body, status_code=exc.status_code)
+    view = _view(release)
+    return {
+        "release_id": view["release_id"],
+        "version": view["version"],
+        "state": view["state"],
+        "state_label": view["state_label"],
+        "published_at": view.get("published_at"),
+        "redirect": f"/result/{view['release_id']}",
+    }
+
+
+@app.get("/api/releases")
+async def api_releases() -> dict:
+    views = [_view(r) for r in store.list_releases(limit=50)]
+    rows = [{
+        "release_id": v["release_id"],
+        "table": v["table"],
+        "version": v["version"],
+        "state": v["state"],
+        "state_label": v["state_label"],
+        "is_current": v["is_current"],
+        "created_at": v["created_at"],
+        "published_at": v.get("published_at"),
+        "source": v["source"],
+        "fingerprint": v["fingerprint"],
+        "summary": v["result"]["summary"],
+    } for v in views]
+    return {"count": len(rows), "releases": rows}
+
+
+@app.get("/api/releases/{release_id}")
+async def api_release(release_id: str):
+    release = _release_or_404(release_id)
+    if release is None:
+        return JSONResponse({"detail": f"发布记录 {release_id} 不存在"}, status_code=404)
+    return _view(release)
+
+
+@app.get("/api/releases/{release_id}/migration.sql", response_class=PlainTextResponse)
+async def api_sql(release_id: str):
+    """下载迁移脚本：只有「当前生效版」可作为可执行方案下载；其余状态一律 409。"""
+    release = _release_or_404(release_id)
+    if release is None:
+        return PlainTextResponse(f"-- 发布记录 {release_id} 不存在\n", status_code=404)
+    view = _view(release)
+    if not view["downloadable"]:
+        current_id = view.get("current_release_id")
+        hint = f"；当前生效版：/api/releases/{current_id}/migration.sql" if current_id else "；当前无生效版"
+        return PlainTextResponse(
+            f"-- 该版本（{release_id} · v{view['version']}）{view['state_label']}，脚本不可作为可执行方案{hint}\n",
+            status_code=409,
+        )
+    return PlainTextResponse(
+        view["result"]["migration"]["sql_text"],
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{report.sql_download_name(view)}"'},
+    )
 
 
 @app.get("/api/samples/{key}")
@@ -139,71 +239,53 @@ async def api_matrix() -> dict:
     return {"version": settings.MATRIX_VERSION, "promotions": matrix_table(), "decimal_rules": DECIMAL_RULES}
 
 
-@app.get("/api/runs")
-async def api_runs() -> dict:
-    rows = store.list_runs(limit=50)
-    return {"count": len(rows), "runs": rows}
-
-
-@app.get("/api/runs/{run_id}")
-async def api_run(run_id: str):
-    try:
-        run = store.load_run(run_id)
-    except KeyError:
-        return JSONResponse({"detail": f"运行记录 {run_id} 不存在"}, status_code=404)
-    return run
-
-
-@app.get("/api/runs/{run_id}/migration.sql", response_class=PlainTextResponse)
-async def api_sql(run_id: str):
-    try:
-        run = store.load_run(run_id)
-    except KeyError:
-        return PlainTextResponse(f"-- 运行记录 {run_id} 不存在\n", status_code=404)
-    return PlainTextResponse(
-        run["migration"]["sql_text"],
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{report.sql_download_name(run)}"'},
-    )
-
-
-@app.get("/result/{run_id}", response_class=HTMLResponse)
-async def result_page(request: Request, run_id: str):
-    try:
-        run = store.load_run(run_id)
-    except KeyError:
+@app.get("/result/{release_id}", response_class=HTMLResponse)
+async def result_page(request: Request, release_id: str):
+    release = _release_or_404(release_id)
+    if release is None:
         return templates.TemplateResponse(
             request, "not_found.html",
             _ctx(
                 request, "",
                 page="not_found",
-                run_id=run_id,
-                max_runs=settings.MAX_RUNS_KEPT,
-                error=f"运行记录 {run_id} 不存在（历史记录只保留最近 {settings.MAX_RUNS_KEPT} 次）",
+                release_id=release_id,
+                max_releases=settings.MAX_RELEASES_KEPT,
+                error=f"发布记录 {release_id} 不存在（历史记录只保留最近 {settings.MAX_RELEASES_KEPT} 次）",
             ),
             status_code=404,
         )
+    view = _view(release)
     return templates.TemplateResponse(
         request, "result.html",
-        _ctx(request, "", page="result", run=run, overview=report.overview(run)),
+        _ctx(
+            request, "",
+            page="result",
+            release=view,
+            run=view["result"],
+            overview=report.overview(view),
+            publish_blockers=rel.publish_blockers(release, rel.current_rules_digest()),
+        ),
     )
 
 
 @app.get("/review", response_class=HTMLResponse)
 async def review_page(request: Request):
-    runs = store.list_runs(limit=50)
-    latest = store.load_run(runs[0]["run_id"]) if runs else None
+    current = store.load_current()
+    views = [_view(r) for r in store.list_releases(limit=50)]
+    current_views = [v for v in views if v["is_current"]]
+    latest = views[0] if views else None
     return templates.TemplateResponse(
         request, "review.html",
         _ctx(
             request, "/review",
             page="review",
-            runs=runs,
-            run_count=len(runs),
+            releases=views,
+            release_count=len(views),
+            current_views=current_views,
             latest=latest,
             promotions=matrix_table(),
             decimal_rules=DECIMAL_RULES,
             sample_index=schemaio.load_sample_index(),
-            max_runs=settings.MAX_RUNS_KEPT,
+            max_releases=settings.MAX_RELEASES_KEPT,
         ),
     )

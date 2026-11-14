@@ -91,7 +91,6 @@ def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输
             "direction_label": item.get("direction_label"),
         })
     run = {
-        "run_id": None,
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "source": source,
         "table": new["table"],
@@ -138,13 +137,18 @@ def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输
     return run
 
 
-def overview(run: dict) -> dict:
+def overview(release: dict) -> dict:
+    """结果页头部摘要：release 的展示字段 + 冻结结果里的 summary。"""
+    run = release["result"]
     s = run["summary"]
     return {
-        "run_id": run["run_id"],
-        "table": run["table"],
-        "created_at": run["created_at"],
-        "source": run["source"],
+        "release_id": release["release_id"],
+        "version": release["version"],
+        "state": release.get("state"),
+        "table": release["table"],
+        "created_at": release["created_at"],
+        "published_at": release.get("published_at"),
+        "source": release["source"],
         "level": s["level"],
         "level_label": s["level_label"],
         "sql_steps": s["sql_steps"],
@@ -156,5 +160,5 @@ def overview(run: dict) -> dict:
     }
 
 
-def sql_download_name(run: dict) -> str:
-    return f"{run['table']}-{run['run_id']}.sql"
+def sql_download_name(release: dict) -> str:
+    return f"{release['table']}-v{release['version']}-{release['release_id']}.sql"

@@ -1,30 +1,30 @@
 {% extends "base.html" %}
 {% block title %}复核与导出 · {{ app_name }}{% endblock %}
 {% block crumb %}复核与导出{% endblock %}
-{% block meta %}<span class="dot {% if runs %}ok{% else %}warn{% endif %}"></span>历史对比 {{ runs|length }} 条{% if latest %} · 最近 {{ latest.run_id }}{% endif %}{% endblock %}
+{% block meta %}<span class="dot {% if releases %}ok{% else %}warn{% endif %}"></span>发布记录 {{ releases|length }} 条 · 当前生效 {{ current_views|length }} 版{% endblock %}
 {% block actions %}
-{% if latest %}<a class="btn secondary small" href="/api/runs/{{ latest.run_id }}/migration.sql">下载最近迁移 SQL</a>{% endif %}
+{% if current_views %}<a class="btn secondary small" href="/api/releases/{{ current_views[0].release_id }}/migration.sql">下载当前生效 SQL</a>{% endif %}
 <a class="btn small" href="/workbench">回工作台</a>
 {% endblock %}
-{% block status_left %}历史对比全部落在 data/runs/*.json（最多保留 {{ max_runs }} 条）· 迁移脚本按 run 单独下载 · 同一输入重跑产生新记录{% endblock %}
-{% block status_right %}{% if latest %}最近运行 <code>{{ latest.run_id }}</code> · {{ latest.table }}{% else %}{{ app_name }}{% endif %}{% endblock %}
+{% block status_left %}发布记录落在 data/releases/*.json（最多保留 {{ max_releases }} 条）· 当前版指针 data/current.json · 只有当前生效版可下载脚本{% endblock %}
+{% block status_right %}{% if current_views %}生效版 <code>{{ current_views[0].release_id }}</code> · {{ current_views[0].table }}{% else %}{{ app_name }}{% endif %}{% endblock %}
 
 {% block content %}
 <div class="page-head">
   <div>
     <h1 class="page-title">复核与导出</h1>
-    <p class="page-sub">每行一次真实对比；搜索与兼容级别筛选即时生效（纯前端），迁移脚本按 run 单独下载。同一输入重复执行会产生新记录，旧记录保留，便于对比不同版本。</p>
+    <p class="page-sub">每行一个受控发布版本：预演 → 阻断清零 → 发布为当前生效版。相同冻结输入重试不新增版本；规则或清单变化后旧方案自动失效，失效版脚本不可下载。</p>
   </div>
   <div class="page-head-actions">
-    {% if latest %}<a class="btn small" href="/api/runs/{{ latest.run_id }}/migration.sql">下载迁移 SQL</a>{% endif %}
-    <a class="btn secondary small" href="/workbench">执行新对比</a>
+    {% if current_views %}<a class="btn small" href="/api/releases/{{ current_views[0].release_id }}/migration.sql">下载当前生效 SQL</a>{% endif %}
+    <a class="btn secondary small" href="/workbench">执行新预演</a>
   </div>
 </div>
 
 <div class="split result">
   <section class="panel">
     <div class="toolbar">
-      <input type="search" id="review-search" placeholder="搜索 run_id / 表名 / 来源" aria-label="搜索历史对比">
+      <input type="search" id="review-search" placeholder="搜索 release_id / 表名 / 来源" aria-label="搜索发布记录">
       <select id="review-level" aria-label="按兼容级别筛选">
         <option value="">全部级别</option>
         <option value="full">full</option>
@@ -32,40 +32,41 @@
         <option value="forward">forward</option>
         <option value="none">none</option>
       </select>
-      <span class="small muted" id="review-stat">本页 {{ runs|length }} 条</span>
+      <span class="small muted" id="review-stat">本页 {{ releases|length }} 条</span>
       <span class="spacer"></span>
-      {% if latest %}<a class="btn secondary small" href="/api/runs/{{ latest.run_id }}/migration.sql">下载迁移 SQL</a>{% endif %}
-      <a class="btn secondary small" href="/api/runs">运行记录 JSON</a>
+      <a class="btn secondary small" href="/api/releases">发布记录 JSON</a>
     </div>
 
-    {% if runs %}
+    {% if releases %}
     <div class="table-wrap roomy">
       <table class="dense" id="runs-table">
         <thead>
-          <tr><th style="width:236px">运行 / 时间 / 来源</th><th style="width:104px">表</th>
-            <th style="width:88px">兼容级别</th><th style="width:86px">ALTER / 回填</th>
-            <th style="width:66px">破损引用</th><th style="width:58px">可执行</th><th style="width:80px">操作</th></tr>
+          <tr><th style="width:250px">发布 / 时间 / 来源</th><th style="width:104px">表</th><th style="width:56px">版本</th>
+            <th style="width:120px">状态</th><th style="width:88px">兼容级别</th><th style="width:86px">ALTER / 回填</th>
+            <th style="width:66px">破损引用</th><th style="width:92px">操作</th></tr>
         </thead>
         <tbody>
-        {% for r in runs %}
-          <tr data-level="{{ r.summary.level }}"
-              data-search="{{ r.run_id }} {{ r.table }} {{ r.source }} {{ r.summary.level }}">
+        {% for r in releases %}
+          {% set s = r.result.summary %}
+          <tr data-level="{{ s.level }}"
+              data-search="{{ r.release_id }} {{ r.table }} {{ r.source }} {{ s.level }} {{ r.state_label }}">
             <td>
-              <a class="mono nowrap" href="/result/{{ r.run_id }}">{{ r.run_id }}</a>
+              <a class="mono nowrap" href="/result/{{ r.release_id }}">{{ r.release_id }}</a>
               <div class="small muted">{{ r.created_at }} · {{ r.source }}</div>
             </td>
             <td class="small nowrap"><code>{{ r.table }}</code></td>
+            <td class="num">v{{ r.version }}</td>
+            <td><span class="tag {{ r.state_tag }}">{{ r.state_label }}</span></td>
             <td>
-              {% if r.summary.level == 'full' %}<span class="tag ok">full</span>
-              {% elif r.summary.level == 'backward' %}<span class="tag warn">backward</span>
-              {% elif r.summary.level == 'forward' %}<span class="tag warn">forward</span>
+              {% if s.level == 'full' %}<span class="tag ok">full</span>
+              {% elif s.level == 'backward' %}<span class="tag warn">backward</span>
+              {% elif s.level == 'forward' %}<span class="tag warn">forward</span>
               {% else %}<span class="tag err">none</span>{% endif %}
             </td>
-            <td class="num nowrap">{{ r.summary.sql_steps }} / {{ r.summary.backfill_count }}</td>
-            <td class="num">{{ r.summary.broken_consumers }}</td>
-            <td>{{ '是' if r.summary.can_execute else '否' }}</td>
+            <td class="num nowrap">{{ s.sql_steps }} / {{ s.backfill_count }}</td>
+            <td class="num">{{ s.broken_consumers }}</td>
             <td class="nowrap">
-              <a href="/result/{{ r.run_id }}">查看</a> · <a href="/api/runs/{{ r.run_id }}/migration.sql">SQL</a>
+              <a href="/result/{{ r.release_id }}">查看</a>{% if r.downloadable %} · <a href="/api/releases/{{ r.release_id }}/migration.sql">SQL</a>{% endif %}
             </td>
           </tr>
         {% endfor %}
@@ -74,8 +75,8 @@
     </div>
     <div class="panel-body tight">
       <p class="small muted" style="margin:0">
-        历史对比全部落在 <code>data/runs/*.json</code>，点任意一条可回到结果页；迁移脚本按 run 单独下载。
-        同一输入重复执行会产生新记录，旧记录保留，便于对比不同版本。
+        发布记录全部落在 <code>data/releases/*.json</code>，当前生效版指针在 <code>data/current.json</code>；
+        结果页、本列表与下载脚本永远指向同一版。只有「当前生效版」提供 SQL 下载；已失效（规则更新 / 被取代）的版本不可下载。
       </p>
     </div>
     <div class="panel-actions">
@@ -83,12 +84,12 @@
       {% for s in sample_index %}
       <a class="btn secondary small" href="/workbench?sample={{ s.key }}">样例 {{ s.key }}</a>
       {% endfor %}
-      <a class="btn small" href="/workbench">执行新对比</a>
+      <a class="btn small" href="/workbench">执行新预演</a>
     </div>
     {% else %}
     <div class="empty">
-      <strong>还没有对比记录</strong>
-      先到工作台跑一组样例（A 完全兼容 / B 需回填 / C 破坏性），这里会出现逐条可回看的历史与 SQL 下载入口。
+      <strong>还没有发布记录</strong>
+      先到工作台跑一组样例（A 完全兼容 / B 需回填 / C 破坏性）生成预演，阻断清零后发布为当前生效版。
       <div style="margin-top:10px"><a class="btn small" href="/workbench?sample=A">用样例 A 跑一次</a></div>
     </div>
     {% endif %}
@@ -107,6 +108,7 @@
         <p class="small muted" style="margin:0">
           判定口径：<code>promotion(旧类型, 新类型)</code> 回答「旧数据里的值能否被新类型无损读取」；
           反方向（新写旧读）用同样的表反向查一次。矩阵版本 {{ matrix_version }}。
+          每次发布冻结当时的矩阵内容；矩阵一旦更新，旧版本自动失效。
         </p>
       </div>
       <div class="table-wrap auto">
@@ -129,42 +131,69 @@
       </div>
     </section>
 
+    {% if current_views %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>当前生效版</h2>
+        <div class="panel-actions"><span class="tag ok">{{ current_views|length }} 张表</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>表</th><th style="width:90px">版本</th><th style="width:200px">release</th><th style="width:150px">操作</th></tr></thead>
+          <tbody>
+            {% for v in current_views %}
+            <tr>
+              <td class="small nowrap"><code>{{ v.table }}</code></td>
+              <td class="num">v{{ v.version }}</td>
+              <td><a class="mono nowrap" href="/result/{{ v.release_id }}">{{ v.release_id }}</a></td>
+              <td class="nowrap">
+                <a href="/result/{{ v.release_id }}">查看</a> · <a href="/api/releases/{{ v.release_id }}/migration.sql">SQL</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
+
     {% if latest %}
     <section class="panel">
       <div class="panel-head">
-        <h2>最近运行详情</h2>
-        <div class="panel-actions"><a class="btn secondary small" href="/result/{{ latest.run_id }}">打开结果页</a></div>
+        <h2>最近发布详情</h2>
+        <div class="panel-actions"><a class="btn secondary small" href="/result/{{ latest.release_id }}">打开结果页</a></div>
       </div>
       <div class="panel-body tight">
         <p class="small" style="margin:0 0 6px">
-          <code class="mono">{{ latest.run_id }}</code> · <code>{{ latest.table }}</code> · {{ latest.created_at }}
+          <code class="mono">{{ latest.release_id }}</code> · <code>{{ latest.table }}</code> · v{{ latest.version }} ·
+          <span class="tag {{ latest.state_tag }}">{{ latest.state_label }}</span>
         </p>
         <div class="kpi-strip" style="margin-bottom:8px">
-          <div class="kpi {% if latest.summary.level == 'full' %}ok{% elif latest.summary.level == 'none' %}err{% else %}warn{% endif %}">
+          <div class="kpi {% if latest.result.summary.level == 'full' %}ok{% elif latest.result.summary.level == 'none' %}err{% else %}warn{% endif %}">
             <div class="k-label">兼容级别</div>
-            <div class="k-value" style="font-size:15px">{{ latest.summary.level }}</div>
-            <div class="k-note">{{ latest.summary.level_label }}</div>
+            <div class="k-value" style="font-size:15px">{{ latest.result.summary.level }}</div>
+            <div class="k-note">{{ latest.result.summary.level_label }}</div>
           </div>
           <div class="kpi">
             <div class="k-label">ALTER / 回填</div>
-            <div class="k-value">{{ latest.summary.sql_steps }}</div>
-            <div class="k-note">回填对象 {{ latest.summary.backfill_count }} 个</div>
+            <div class="k-value">{{ latest.result.summary.sql_steps }}</div>
+            <div class="k-note">回填对象 {{ latest.result.summary.backfill_count }} 个</div>
           </div>
-          <div class="kpi {% if latest.summary.blocking_count %}err{% else %}ok{% endif %}">
+          <div class="kpi {% if latest.result.summary.blocking_count %}err{% else %}ok{% endif %}">
             <div class="k-label">阻断</div>
-            <div class="k-value">{{ latest.summary.blocking_count }}</div>
-            <div class="k-note">破损引用 {{ latest.summary.broken_consumers }} · 需改名 {{ latest.summary.needs_update }}</div>
+            <div class="k-value">{{ latest.result.summary.blocking_count }}</div>
+            <div class="k-note">破损引用 {{ latest.result.summary.broken_consumers }} · 需改名 {{ latest.result.summary.needs_update }}</div>
           </div>
         </div>
         <ul class="list small" style="margin:0">
-          <li>字段匹配 {{ latest.match.rows|length }} 条 · 改名 {{ latest.summary.renamed }} · 新增 {{ latest.summary.added }} · 删除 {{ latest.summary.removed }}</li>
-          <li>类型变更 {{ latest.type_changes|length }} 条 · 本次用到矩阵条目 {{ latest.matrix_usage|length }} 条</li>
-          <li>能否执行迁移：{{ '是' if latest.summary.can_execute else '否（有阻断）' }} · 数据文件 {{ latest.consumers_check.files }} 个 / 引用 {{ latest.consumers_check.total_refs }} 处</li>
+          <li>字段匹配 {{ latest.result.match.rows|length }} 条 · 改名 {{ latest.result.summary.renamed }} · 新增 {{ latest.result.summary.added }} · 删除 {{ latest.result.summary.removed }}</li>
+          <li>类型变更 {{ latest.result.type_changes|length }} 条 · 本次用到矩阵条目 {{ latest.result.matrix_usage|length }} 条</li>
+          <li>指纹 <code>{{ latest.short_fingerprint }}</code> · 冻结于 {{ latest.created_at }}{% if latest.published_at %} · 发布于 {{ latest.published_at }}{% endif %}</li>
         </ul>
       </div>
       <div class="panel-actions">
-        <a class="btn small" href="/api/runs/{{ latest.run_id }}/migration.sql">下载迁移 SQL</a>
-        <a class="btn secondary small" href="/result/{{ latest.run_id }}">逐条依据</a>
+        {% if latest.downloadable %}<a class="btn small" href="/api/releases/{{ latest.release_id }}/migration.sql">下载迁移 SQL</a>{% endif %}
+        <a class="btn secondary small" href="/result/{{ latest.release_id }}">逐条依据</a>
       </div>
     </section>
     {% endif %}

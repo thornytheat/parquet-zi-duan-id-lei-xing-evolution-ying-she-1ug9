@@ -6,15 +6,15 @@
 <a class="btn secondary small" href="/">回总览</a>
 <a class="btn secondary small" href="/review">复核与导出</a>
 {% endblock %}
-{% block status_left %}字段匹配 → 类型矩阵 → 兼容判定 → 迁移计划 → 列引用检查 · 结果写入 data/runs/*.json{% endblock %}
-{% block status_right %}当前预演 样例 {{ selected }} · 表 <code>{{ sample.old.table }}</code> · 未落库{% endblock %}
+{% block status_left %}字段匹配 → 类型矩阵 → 兼容判定 → 迁移计划 → 列引用检查 · 受控发布：预演 → 阻断清零 → 发布{% endblock %}
+{% block status_right %}当前即时预演 样例 {{ selected }} · 表 <code>{{ sample.old.table }}</code> · 不落库{% endblock %}
 
 {% block content %}
 {% set ps = preview.summary %}
 <div class="page-head">
   <div>
     <h1 class="page-title">Schema 对比工作台</h1>
-    <p class="page-sub">选一组样例或直接粘贴两版 schema JSON，点「执行对比」进入结果页查看逐条依据；右侧是按当前样例实时预演的匹配、类型、兼容与迁移口径（不落库）。schema 保持 JSON 描述，不装 pyarrow。</p>
+    <p class="page-sub">选一组样例或直接粘贴两版 schema JSON，点「生成预演」冻结本次规则、两版字段与读取方清单并进入结果页；阻断全部消除后在结果页一键发布为当前生效版。右侧是按当前样例的即时预演（不落库、不产生版本）。schema 保持 JSON 描述，不装 pyarrow。</p>
   </div>
 </div>
 
@@ -52,20 +52,21 @@
       <div id="ok-box" class="alert alert-info" hidden></div>
 
       <details class="help">
-        <summary>类型写法 / 匹配口径 / 校验规则</summary>
+        <summary>类型写法 / 匹配口径 / 发布流程</summary>
         <ul class="list small" style="margin-bottom:0">
           <li>类型可写 <code>decimal(10,2)</code>；field_id 用整数，允许某一侧没有 id（此时按名称匹配并标注依据）。</li>
           <li>field_id 相同优先认定为同一列；id 同名称变 → renamed，名称同 id 变 → id_changed（人工确认）。</li>
           <li>表外类型对一律 unknown，不猜；分区字段被删或改类型直接双向阻断。</li>
-          <li>解析失败返回 4xx 明确文案，页面不丢输入；执行成功自动跳到 <code>/result/{run_id}</code>。</li>
+          <li>「生成预演」把本次规则、两版字段与读取方清单冻结成一个版本；相同输入重试回到同一版本，不新增。</li>
+          <li>阻断全部消除后才能在结果页「发布」；发布是原子切换，失败保留上一版；规则或清单变化后旧方案自动失效。</li>
         </ul>
       </details>
     </div>
     <div class="panel-actions">
-      <button type="button" id="btn-run">执行对比</button>
+      <button type="button" id="btn-run">生成预演</button>
       <button type="button" class="secondary" id="btn-load">载入该样例</button>
       <a class="btn secondary small" href="/review">查看历史</a>
-      <span class="small muted" style="align-self:center">执行成功自动跳转结果页</span>
+      <span class="small muted" style="align-self:center">预演成功自动跳转结果页，发布后才是生效结论</span>
     </div>
   </section>
 
@@ -139,7 +140,7 @@
       </div>
       <div class="panel-body tight">
         <p class="small muted" style="margin:0">
-          预演基于当前载入的样例 {{ selected }}（<code>{{ sample.old.table }}</code>）；粘贴自定义 JSON 后点「执行对比」，实际逐条结论以结果页为准。
+          即时预演基于当前载入的样例 {{ selected }}（<code>{{ sample.old.table }}</code>），不落库；粘贴自定义 JSON 后点「生成预演」会冻结输入并产生版本，逐条结论以结果页为准。
         </p>
       </div>
     </section>
@@ -292,7 +293,7 @@
           {% for item in preview.migration.upgrade_order %}<li>{{ item }}</li>{% endfor %}
         </ol>
         <details class="help" style="margin-top:8px">
-          <summary>预演迁移 SQL（样例 {{ selected }}，执行后可在结果页下载）</summary>
+          <summary>即时预演迁移 SQL（样例 {{ selected }}；发布后才能在结果页下载生效脚本）</summary>
           <pre class="sql" id="preview-sql">{{ preview.migration.sql_text }}</pre>
         </details>
       </div>
@@ -326,7 +327,7 @@
           <a class="btn secondary small" href="/workbench?sample=B">复跑样例 B</a>
           <a class="btn secondary small" href="/workbench?sample=C">复跑样例 C</a>
           <a class="btn secondary small" href="/review">复核页（历史 + SQL 下载 + 完整矩阵）</a>
-          <a class="btn secondary small" href="/api/runs">运行记录 JSON</a>
+          <a class="btn secondary small" href="/api/releases">发布记录 JSON</a>
         </p>
       </div>
     </section>

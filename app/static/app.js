@@ -81,25 +81,27 @@
     runBtn.addEventListener('click', async function () {
       hideBoxes();
       runBtn.disabled = true;
-      runBtn.textContent = '计算中…';
+      runBtn.textContent = '冻结并预演…';
       try {
         var payload = {
           old: oldEl ? oldEl.value : '',
           new: newEl ? newEl.value : '',
           consumers: consEl ? consEl.value : ''
         };
-        var data = await window.postJSON('/api/compare', payload);
+        var data = await window.postJSON('/api/releases/preview', payload);
         if (okBox) {
           okBox.hidden = false;
-          okBox.textContent = '对比完成：' + data.summary.level_label + '，ALTER ' +
-            data.summary.sql_steps + ' 条，broken_consumers ' + data.summary.broken_consumers + ' 处。正在跳转结果页…';
+          okBox.textContent = (data.created ? '预演已生成：' : '相同输入已存在，回到原版本：') +
+            data.release_id + '（v' + data.version + '，' + data.summary.level_label +
+            '，ALTER ' + data.summary.sql_steps + ' 条，broken_consumers ' +
+            data.summary.broken_consumers + ' 处）。正在跳转结果页…';
         }
         window.location.href = data.redirect;
       } catch (err) {
         if (errBox) window.showError(errBox, err);
       } finally {
         runBtn.disabled = false;
-        runBtn.textContent = '执行对比';
+        runBtn.textContent = '生成预演';
       }
     });
 
@@ -146,7 +148,30 @@
     applyFilter();
   }
 
-  // ---- 5) 结果页：复制 SQL ----
+  // ---- 5) 结果页：发布 / 重试发布（受控发布：原子切换，失败保留上一版）----
+  var publishBtn = qs('#btn-publish');
+  if (publishBtn) {
+    var publishErr = qs('#publish-error');
+    publishBtn.addEventListener('click', async function () {
+      var releaseId = publishBtn.getAttribute('data-release');
+      if (!releaseId) return;
+      if (publishErr) publishErr.hidden = true;
+      publishBtn.disabled = true;
+      var label = publishBtn.textContent;
+      publishBtn.textContent = '发布中…';
+      try {
+        var data = await window.postJSON('/api/releases/' + encodeURIComponent(releaseId) + '/publish', {});
+        publishBtn.textContent = '已生效，正在刷新…';
+        window.location.href = data.redirect || window.location.href;
+      } catch (err) {
+        if (publishErr) window.showError(publishErr, err);
+        publishBtn.disabled = false;
+        publishBtn.textContent = label;
+      }
+    });
+  }
+
+  // ---- 6) 结果页：复制 SQL ----
   var sqlBlock = qs('#sql-block');
   if (sqlBlock && navigator.clipboard) {
     var copyBtn = document.createElement('button');

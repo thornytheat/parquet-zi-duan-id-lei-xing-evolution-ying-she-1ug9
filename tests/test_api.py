@@ -1,17 +1,34 @@
-"""API + 端到端：成功、4xx、A/B/C 三组真实样例会跑。"""
-import json
-
+"""API + 端到端：受控发布全流程（预演 → 发布 → 失效），含 A/B/C 三组真实样例。"""
 import pytest
 from fastapi.testclient import TestClient
 
+from app import settings, store
 from app.main import app
 
 client = TestClient(app)
 
 
-def post_json(payload):
-    return client.post("/api/compare", json=payload)
+def preview(payload):
+    return client.post("/api/releases/preview", json=payload)
 
+
+def publish(release_id):
+    return client.post(f"/api/releases/{release_id}/publish")
+
+
+def get_release(release_id):
+    return client.get(f"/api/releases/{release_id}")
+
+
+def custom_payload(table, old_fields, new_fields, files):
+    return {
+        "old": {"table": table, "fields": old_fields},
+        "new": {"table": table, "fields": new_fields},
+        "consumers": {"table": table, "files": files},
+    }
+
+
+# ---------------------------------------------------------------- 基础页面
 
 def test_health_ok():
     res = client.get("/health")
@@ -28,58 +45,260 @@ def test_index_and_workbench_render():
     assert "dwd_payment" in bench.text
 
 
-def test_sample_a_is_full_with_zero_migration():
-    res = post_json({"sample": "A"})
-    assert res.status_code == 200
-    body = res.json()
+# ---------------------------------------------------------------- 样例 A/B/C 主流程
+
+def test_sample_a_preview_publish_and_download():
+    body = preview({"sample": "A"}).json()
     assert body["summary"]["level"] == "full"
     assert body["summary"]["sql_steps"] == 0
-    assert body["summary"]["broken_consumers"] == 0
-    page = client.get(body["redirect"])
+    assert body["state"] == "preview"
+
+    res = publish(body["release_id"])
+    assert res.status_code == 200
+    assert res.json()["state"] == "published"
+
+    page = client.get(f"/result/{body['release_id']}")
     assert page.status_code == 200
-    assert "字段匹配" in page.text
+    assert "当前生效版" in page.text
+
+    sql = client.get(f"/api/releases/{body['release_id']}/migration.sql")
+    assert sql.status_code == 200
+    assert "attachment" in sql.headers.get("content-disposition", "")
 
 
 def test_sample_b_rename_added_backfill_and_alter_order():
-    body = post_json({"sample": "B"}).json()
+    body = preview({"sample": "B"}).json()
     summary = body["summary"]
     assert summary["level"] == "backward"
     assert summary["renamed"] == 1
     assert summary["added"] == 2
     assert summary["backfill_count"] == 1
     assert summary["sql_steps"] == 4
-    run = client.get(f"/api/runs/{body['run_id']}").json()
-    sql = run["migration"]["sql_text"]
+
+    res = publish(body["release_id"])
+    assert res.status_code == 200, res.json()
+
+    run = get_release(body["release_id"]).json()
+    assert run["state"] == "published"
+    sql = run["result"]["migration"]["sql_text"]
     assert "RENAME COLUMN channel TO pay_channel" in sql
     assert "ADD COLUMN fee" in sql
     assert "ALTER COLUMN amount TYPE decimal(18,2)" in sql
     assert sql.index("RENAME COLUMN") < sql.index("ADD COLUMN") < sql.index("ALTER COLUMN")
-    assert run["consumers_check"]["needs_update_count"] == 2
+    assert run["result"]["consumers_check"]["needs_update_count"] == 2
+
+    dl = client.get(f"/api/releases/{body['release_id']}/migration.sql")
+    assert dl.status_code == 200
+    assert "RENAME COLUMN" in dl.text
 
 
-def test_sample_c_is_none_with_three_blocks_and_broken_consumers():
-    body = post_json({"sample": "C"}).json()
+def test_sample_c_blocked_cannot_publish():
+    body = preview({"sample": "C"}).json()
     summary = body["summary"]
     assert summary["level"] == "none"
     assert summary["blocking_count"] == 3
     assert summary["can_execute"] is False
     assert summary["broken_consumers"] > 0
-    run = client.get(f"/api/runs/{body['run_id']}").json()
-    codes = {b["code"] for b in run["block_reasons"]}
+
+    res = publish(body["release_id"])
+    assert res.status_code == 409
+    detail = res.json()
+    assert "阻断" in detail["detail"]
+    assert len(detail["blockers"]) >= 3
+
+    run = get_release(body["release_id"]).json()
+    assert run["state"] == "preview"
+    codes = {b["code"] for b in run["result"]["block_reasons"]}
     assert codes == {"type_blocked", "partition_type_changed", "field_removed"}
-    columns = {b["column"] for b in run["consumers_check"]["broken"]}
-    assert "status" in columns or "weight_gram" in columns
+
+    # 预演版不是可执行方案：下载一律 409
+    assert client.get(f"/api/releases/{body['release_id']}/migration.sql").status_code == 409
 
 
-def test_custom_schemas_work():
-    old = {"table": "t", "fields": [{"id": 1, "name": "a", "type": "int32"}]}
-    new = {"table": "t", "fields": [{"id": 1, "name": "a", "type": "int64"}]}
-    consumers = {"table": "t", "files": [{"path": "s3://x/part-0.parquet", "columns": ["a"]}]}
-    res = post_json({"old": old, "new": new, "consumers": consumers})
-    assert res.status_code == 200
-    # int32→int64：旧写新读兼容，新写旧读（旧读方拿到更宽的值）被阻断 → backward
-    assert res.json()["summary"]["level"] == "backward"
+# ---------------------------------------------------------------- 幂等：相同冻结输入不新增版本
 
+def test_preview_is_idempotent_for_same_frozen_input():
+    payload = custom_payload(
+        "t_idem",
+        [{"id": 1, "name": "a", "type": "int32"}],
+        [{"id": 1, "name": "a", "type": "int64"}],
+        [{"path": "s3://x/p0.parquet", "columns": ["a"]}],
+    )
+    first = preview(payload).json()
+    assert first["created"] is True
+    second = preview(payload).json()
+    assert second["created"] is False
+    assert second["release_id"] == first["release_id"]
+    assert second["version"] == first["version"]
+    # 键序不同、语义相同也算同一输入
+    shuffled = {
+        "consumers": {"files": [{"columns": ["a"], "path": "s3://x/p0.parquet"}], "table": "t_idem"},
+        "new": {"fields": [{"type": "int64", "name": "a", "id": 1}], "table": "t_idem"},
+        "old": {"fields": [{"type": "int32", "name": "a", "id": 1}], "table": "t_idem"},
+    }
+    assert preview(shuffled).json()["release_id"] == first["release_id"]
+
+
+def test_new_input_gets_new_version():
+    base = custom_payload("t_ver", [{"id": 1, "name": "a", "type": "int32"}],
+                          [{"id": 1, "name": "a", "type": "int64"}],
+                          [{"path": "s3://x/p0.parquet", "columns": ["a"]}])
+    v1 = preview(base).json()
+    changed = custom_payload("t_ver", [{"id": 1, "name": "a", "type": "int32"}],
+                             [{"id": 1, "name": "a", "type": "int64"}, {"id": 2, "name": "b", "type": "string"}],
+                             [{"path": "s3://x/p0.parquet", "columns": ["a"]}])
+    v2 = preview(changed).json()
+    assert v2["release_id"] != v1["release_id"]
+    assert v2["version"] == v1["version"] + 1
+
+
+def test_publish_is_idempotent_noop():
+    body = preview(custom_payload("t_pubidem", [{"id": 1, "name": "a", "type": "int32"}],
+                                  [{"id": 1, "name": "a", "type": "int64"}],
+                                  [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+    assert publish(body["release_id"]).status_code == 200
+    again = publish(body["release_id"])
+    assert again.status_code == 200
+    assert again.json()["state"] == "published"
+    assert get_release(body["release_id"]).json()["version"] == body["version"]
+
+
+# ---------------------------------------------------------------- 失败保留上一版，重试不新增版本
+
+def test_failed_publish_keeps_previous_and_retry_reuses_same_release(monkeypatch):
+    v1 = preview(custom_payload("t_fail", [{"id": 1, "name": "a", "type": "int32"}],
+                                [{"id": 1, "name": "a", "type": "int64"}],
+                                [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+    assert publish(v1["release_id"]).status_code == 200
+
+    v2 = preview(custom_payload("t_fail", [{"id": 1, "name": "a", "type": "int32"}],
+                                [{"id": 1, "name": "a", "type": "int64"}, {"id": 2, "name": "b", "type": "string"}],
+                                [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+
+    def boom(table, release_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "set_current", boom)
+    res = publish(v2["release_id"])
+    assert res.status_code == 500
+    assert "上一版" in res.json()["detail"]
+
+    # 上一版仍是生效版；失败版不可下载，结果页展示失败横幅与重试入口
+    assert get_release(v2["release_id"]).json()["state"] == "failed"
+    assert client.get(f"/api/releases/{v1['release_id']}/migration.sql").status_code == 200
+    assert client.get(f"/api/releases/{v2['release_id']}/migration.sql").status_code == 409
+    failed_page = client.get(f"/result/{v2['release_id']}")
+    assert "发布失败" in failed_page.text
+    assert "重试发布" in failed_page.text
+
+    monkeypatch.undo()
+    # 相同冻结输入重试：回到同一个 release，不新增版本
+    retry = preview(custom_payload("t_fail", [{"id": 1, "name": "a", "type": "int32"}],
+                                   [{"id": 1, "name": "a", "type": "int64"}, {"id": 2, "name": "b", "type": "string"}],
+                                   [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+    assert retry["created"] is False
+    assert retry["release_id"] == v2["release_id"]
+    assert retry["version"] == v2["version"]
+
+    assert publish(v2["release_id"]).status_code == 200
+    current = store.load_current()
+    assert current["t_fail"]["release_id"] == v2["release_id"]
+    assert get_release(v1["release_id"]).json()["state"] == "superseded"
+
+
+# ---------------------------------------------------------------- 规则 / 清单变化后旧方案失效
+
+def test_rules_change_invalidates_old_release(monkeypatch):
+    payload = custom_payload("t_stale", [{"id": 1, "name": "a", "type": "int32"}],
+                             [{"id": 1, "name": "a", "type": "int64"}],
+                             [{"path": "s3://x/p0.parquet", "columns": ["a"]}])
+    v1 = preview(payload).json()
+    assert publish(v1["release_id"]).status_code == 200
+    assert client.get(f"/api/releases/{v1['release_id']}/migration.sql").status_code == 200
+
+    monkeypatch.setattr(settings, "MATRIX_VERSION", "type-matrix/2099.01")
+
+    # 旧方案失效：状态 stale、下载 409、不可再发布，结果页展示失效横幅
+    assert get_release(v1["release_id"]).json()["state"] == "stale"
+    assert client.get(f"/api/releases/{v1['release_id']}/migration.sql").status_code == 409
+    assert publish(v1["release_id"]).status_code == 409
+    assert "已失效" in client.get(f"/result/{v1['release_id']}").text
+
+    # 相同输入按新规则重新预演 → 新版本（指纹含规则摘要）
+    v2 = preview(payload).json()
+    assert v2["created"] is True
+    assert v2["release_id"] != v1["release_id"]
+    assert publish(v2["release_id"]).status_code == 200
+    assert store.load_current()["t_stale"]["release_id"] == v2["release_id"]
+
+
+def test_consumer_list_change_supersedes_old_release():
+    v1 = preview(custom_payload("t_super", [{"id": 1, "name": "a", "type": "int32"}],
+                                [{"id": 1, "name": "a", "type": "int64"}],
+                                [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+    assert publish(v1["release_id"]).status_code == 200
+
+    # 读取方清单变化 → 新指纹 → 新版本；发布后旧版被取代、脚本失效
+    v2 = preview(custom_payload("t_super", [{"id": 1, "name": "a", "type": "int32"}],
+                                [{"id": 1, "name": "a", "type": "int64"}],
+                                [{"path": "s3://x/p0.parquet", "columns": ["a"]},
+                                 {"path": "s3://x/p1.parquet", "columns": ["a"]}])).json()
+    assert v2["release_id"] != v1["release_id"]
+    assert publish(v2["release_id"]).status_code == 200
+
+    old = get_release(v1["release_id"]).json()
+    assert old["state"] == "superseded"
+    assert client.get(f"/api/releases/{v1['release_id']}/migration.sql").status_code == 409
+    page = client.get(f"/result/{v1['release_id']}")
+    assert "已失效" in page.text
+    assert client.get(f"/api/releases/{v2['release_id']}/migration.sql").status_code == 200
+
+
+def test_broken_consumers_block_publish():
+    # 删列本身不阻断迁移（can_execute=True），但 broken_consumers 必须拦住发布
+    body = preview(custom_payload(
+        "t_broken",
+        [{"id": 1, "name": "a", "type": "int32"}, {"id": 2, "name": "b", "type": "string"}],
+        [{"id": 1, "name": "a", "type": "int64"}],
+        [{"path": "s3://x/p0.parquet", "columns": ["a", "b"]}],
+    )).json()
+    assert body["summary"]["can_execute"] is True
+    assert body["summary"]["broken_consumers"] == 1
+    res = publish(body["release_id"])
+    assert res.status_code == 409
+    codes = {b["code"] for b in res.json()["blockers"]}
+    assert "broken_consumer" in codes
+
+
+# ---------------------------------------------------------------- 结果页 / 历史 / 下载指向同一版
+
+def test_result_history_and_download_point_to_same_version():
+    body = preview(custom_payload("t_same", [{"id": 1, "name": "a", "type": "int32"}],
+                                  [{"id": 1, "name": "a", "type": "int64"}],
+                                  [{"path": "s3://x/p0.parquet", "columns": ["a"]}])).json()
+    assert publish(body["release_id"]).status_code == 200
+
+    page = client.get(f"/result/{body['release_id']}")
+    assert page.status_code == 200
+    assert "当前生效版" in page.text
+    assert f"/api/releases/{body['release_id']}/migration.sql" in page.text
+
+    rows = client.get("/api/releases").json()["releases"]
+    row = next(r for r in rows if r["release_id"] == body["release_id"])
+    assert row["is_current"] is True
+    assert row["state"] == "published"
+
+    review = client.get("/review")
+    assert review.status_code == 200
+    assert body["release_id"] in review.text
+    assert "当前生效版" in review.text
+
+    sql = client.get(f"/api/releases/{body['release_id']}/migration.sql")
+    assert sql.status_code == 200
+    assert "ALTER TABLE t_same" in sql.text
+
+
+# ---------------------------------------------------------------- 输入校验与 404
 
 @pytest.mark.parametrize("payload,needle", [
     ({"old": "{bad json", "new": {}, "consumers": {}}, "不是合法 JSON"),
@@ -97,13 +316,13 @@ def test_custom_schemas_work():
       "consumers": {"files": [{"path": "p", "columns": ["a"]}]}}, "表名不一致"),
 ])
 def test_bad_inputs_return_400(payload, needle):
-    res = post_json(payload)
+    res = preview(payload)
     assert res.status_code == 400
     assert needle in res.json()["detail"]
 
 
 def test_non_json_body_returns_400():
-    res = client.post("/api/compare", content="not-json", headers={"Content-Type": "application/json"})
+    res = client.post("/api/releases/preview", content="not-json", headers={"Content-Type": "application/json"})
     assert res.status_code == 400
 
 
@@ -111,26 +330,20 @@ def test_unknown_sample_returns_404():
     assert client.get("/api/samples/Z").status_code == 404
 
 
-def test_missing_run_returns_404():
-    assert client.get("/api/runs/run-20990101T000000-abcdef").status_code == 404
-    assert client.get("/result/run-20990101T000000-abcdef").status_code == 404
+def test_missing_release_returns_404():
+    assert client.get("/api/releases/rel-20990101T000000-abcdef").status_code == 404
+    assert client.get("/result/rel-20990101T000000-abcdef").status_code == 404
+    assert publish("rel-20990101T000000-abcdef").status_code == 404
+    assert client.get("/api/releases/rel-20990101T000000-abcdef/migration.sql").status_code == 404
 
 
 def test_review_page_and_history():
-    post_json({"sample": "A"})
+    preview({"sample": "A"})
     res = client.get("/review")
     assert res.status_code == 200
     assert "类型矩阵说明" in res.text
-    runs = client.get("/api/runs").json()
-    assert runs["count"] >= 1
-
-
-def test_migration_sql_download():
-    run_id = post_json({"sample": "B"}).json()["run_id"]
-    res = client.get(f"/api/runs/{run_id}/migration.sql")
-    assert res.status_code == 200
-    assert "RENAME COLUMN" in res.text
-    assert "attachment" in res.headers.get("content-disposition", "")
+    rows = client.get("/api/releases").json()
+    assert rows["count"] >= 1
 
 
 def test_matrix_endpoint():

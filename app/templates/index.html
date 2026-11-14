@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block title %}总览 · Parquet 字段 ID 与类型演进映射 · {{ app_name }}{% endblock %}
 {% block crumb %}总览{% endblock %}
-{% block meta %}<span class="dot {% if stats.run_count %}ok{% else %}warn{% endif %}"></span>样例 {{ stats.sample_count }} 组 · 历史 {{ stats.run_count }} 次运行{% endblock %}
+{% block meta %}<span class="dot {% if stats.release_count %}ok{% else %}warn{% endif %}"></span>样例 {{ stats.sample_count }} 组 · 发布记录 {{ stats.release_count }} 条 · 生效 {{ stats.published_count }} 版{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/review">复核与导出</a>
 <a class="btn small" href="/workbench">去工作台</a>
 {% endblock %}
-{% block status_left %}样例 A/B/C 内置 · 矩阵 {{ matrix_version }} · 运行记录落 data/runs/*.json · 不依赖外网{% endblock %}
+{% block status_left %}样例 A/B/C 内置 · 矩阵 {{ matrix_version }} · 受控发布：预演冻结输入 → 阻断清零 → 原子切换生效版{% endblock %}
 {% block status_right %}schemaevo · 匹配 / 矩阵 / 兼容 / 迁移全部后端真算{% endblock %}
 
 {% block content %}
@@ -24,24 +24,24 @@
     <div class="k-note">A 兼容 / B 回填 / C 破坏性</div>
   </div>
   <div class="kpi ok">
-    <div class="k-label">完全兼容</div>
-    <div class="k-value">{{ stats.full_count }}</div>
-    <div class="k-note">历史 {{ stats.run_count }} 次里 level=full</div>
+    <div class="k-label">当前生效版</div>
+    <div class="k-value">{{ stats.published_count }}</div>
+    <div class="k-note">发布记录 {{ stats.release_count }} 条 · full {{ stats.full_count }} 条</div>
   </div>
   <div class="kpi warn">
     <div class="k-label">需回填</div>
     <div class="k-value">{{ stats.backfill_count }}</div>
-    <div class="k-note">含回填对象的运行次数</div>
+    <div class="k-note">含回填对象的发布数</div>
   </div>
   <div class="kpi err">
     <div class="k-label">破坏性</div>
     <div class="k-value">{{ stats.breaking_count }}</div>
-    <div class="k-note">有阻断、脚本不可执行</div>
+    <div class="k-note">有阻断、不可直接发布</div>
   </div>
   <div class="kpi">
     <div class="k-label">平均步骤</div>
     <div class="k-value">{{ stats.avg_steps }}</div>
-    <div class="k-note">平均 ALTER 条数（历史）</div>
+    <div class="k-note">平均 ALTER 条数（全部发布）</div>
   </div>
 </div>
 
@@ -104,16 +104,16 @@
       <ul class="list small" style="margin:6px 0 0">
         <li>输入：两版 <code>schema JSON</code> + <code>consumers.json</code> 数据文件清单。</li>
         <li>输出：兼容级别、字段匹配、类型结论、迁移 SQL、broken_consumers。</li>
-        <li>判定全部后端真算，页面只做呈现；同一输入可反复重跑并回看历史。</li>
+        <li>受控发布：预演冻结「规则 + 两版字段 + 读取方清单」，阻断清零后一次性切换生效版；相同输入重试不新增版本。</li>
       </ul>
     </div>
   </section>
 
   <section class="panel">
     <div class="panel-head">
-      <h2>最近运行</h2>
+      <h2>最近发布</h2>
       <div class="panel-actions">
-        <span class="tag">近 {{ stats.run_count }} 次</span>
+        <span class="tag">共 {{ stats.release_count }} 条</span>
         <a class="btn secondary small" href="/review">全部</a>
       </div>
     </div>
@@ -121,38 +121,38 @@
     <div class="table-wrap">
       <table class="dense">
         <thead>
-          <tr><th style="width:246px">运行 / 时间</th><th style="width:120px">表</th><th style="width:92px">兼容级别</th><th style="width:94px">ALTER / 回填</th><th style="width:74px">破损引用</th><th style="width:62px">可执行</th></tr>
+          <tr><th style="width:236px">发布 / 时间</th><th style="width:110px">表</th><th style="width:60px">版本</th><th style="width:120px">状态</th><th style="width:92px">兼容级别</th><th style="width:94px">ALTER / 回填</th></tr>
         </thead>
         <tbody>
           {% for r in recent %}
           <tr>
-            <td><a class="mono nowrap" href="/result/{{ r.run_id }}">{{ r.run_id }}</a>
+            <td><a class="mono nowrap" href="/result/{{ r.release_id }}">{{ r.release_id }}</a>
               <div class="small muted">{{ r.created_at }}</div></td>
             <td class="small nowrap">{{ r.table }}</td>
+            <td class="num">v{{ r.version }}</td>
+            <td><span class="tag {{ r.state_tag }}">{{ r.state_label }}</span></td>
             <td>
-              {% if r.summary.level == 'full' %}<span class="tag ok">full</span>
-              {% elif r.summary.level == 'backward' %}<span class="tag warn">backward</span>
-              {% elif r.summary.level == 'forward' %}<span class="tag warn">forward</span>
+              {% if r.result.summary.level == 'full' %}<span class="tag ok">full</span>
+              {% elif r.result.summary.level == 'backward' %}<span class="tag warn">backward</span>
+              {% elif r.result.summary.level == 'forward' %}<span class="tag warn">forward</span>
               {% else %}<span class="tag err">none</span>{% endif %}
             </td>
-            <td class="small nowrap">{{ r.summary.sql_steps }} / {{ r.summary.backfill_count }}</td>
-            <td class="num">{{ r.summary.broken_consumers }}</td>
-            <td>{{ '是' if r.summary.can_execute else '否' }}</td>
+            <td class="small nowrap">{{ r.result.summary.sql_steps }} / {{ r.result.summary.backfill_count }}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     <div class="panel-actions">
-      <a class="btn small" href="/workbench">去工作台执行对比</a>
-      {% if recent %}<a class="btn secondary small" href="/result/{{ recent[0].run_id }}">看最近一次结果</a>{% endif %}
+      <a class="btn small" href="/workbench">去工作台生成预演</a>
+      {% if recent %}<a class="btn secondary small" href="/result/{{ recent[0].release_id }}">看最近一次结果</a>{% endif %}
       <a class="btn secondary small" href="/review">复核与导出</a>
     </div>
     {% else %}
     <div class="empty">
-      <strong>还没有任何运行记录</strong>
-      选一组样例（A 兼容 / B 需回填 / C 破坏性）或粘贴两版 schema JSON，点「执行对比」就会生成可回看的 run_id。
-      <div style="margin-top:10px"><a class="btn small" href="/workbench?sample=B">用样例 B 执行对比</a></div>
+      <strong>还没有任何发布记录</strong>
+      选一组样例（A 兼容 / B 需回填 / C 破坏性）或粘贴两版 schema JSON，点「生成预演」冻结输入产生版本，阻断清零后发布为生效版。
+      <div style="margin-top:10px"><a class="btn small" href="/workbench?sample=B">用样例 B 生成预演</a></div>
     </div>
     {% endif %}
   </section>
@@ -172,7 +172,7 @@
     类型判定（逐条给矩阵来源与结论 compatible / blocked / unknown）、
     兼容级别（旧写新读 / 新写旧读双向 → full / backward / forward / none）、
     迁移计划（ALTER 序列、回填对象、读写方升级顺序、broken_consumers）、
-    可下载迁移脚本，历史记录可回看、可重跑。
+    受控发布：预演冻结输入 → 阻断清零 → 原子切换生效版，生效版脚本可下载，历史版本可回看。
   </p>
 
   <h3>五条核心规则（后端真算，代码在纯函数模块里）</h3>
@@ -190,12 +190,12 @@
       <span class="tag err">broken_consumers</span>；引用改名列的 → 需同步改名（Parquet 按 id 仍可读）。</li>
   </ul>
 
-  <h3>演示步骤（4 步走完主流程）</h3>
+  <h3>演示步骤（受控发布主流程）</h3>
   <ol class="list small">
     <li>在工作台点「载入该样例」（或从总览点「用样例 B 执行对比」），工作台会预填旧/新 schema 与数据文件清单。</li>
-    <li>点「执行对比」→ 后端跑字段匹配、类型矩阵、双向兼容判定、迁移计划、列引用检查，写入一条运行记录。</li>
+    <li>点「生成预演」→ 后端冻结本次规则、两版字段与读取方清单，算出一个预演版本（相同输入重试回到同一版本）。</li>
     <li>结果页逐条看依据：字段 id 与名称变化、类型矩阵来源、兼容方向、ALTER 序列、回填对象、broken_consumers。</li>
-    <li>到「复核与导出」看历史、对比不同版本、下载 <code>*.sql</code> 迁移脚本；同一输入可反复重跑。</li>
+    <li>阻断全部消除后点「发布为当前生效版」→ 原子切换；失败保留上一版。到「复核与导出」看历史与生效版、下载生效版 <code>*.sql</code>。</li>
   </ol>
 
   <h3>六个业务模块如何落在页面上</h3>
@@ -208,7 +208,7 @@
         <tr><td><strong>③ 类型矩阵</strong></td><td class="small">工作台「类型矩阵」预演（本次用到的条目）+ 结果页「类型变更」分段 + 复核页完整矩阵表；每条给规则来源。</td></tr>
         <tr><td><strong>④ 兼容判定</strong></td><td class="small">工作台「兼容判定与阻断」+ 结果页顶部双向判定与逐条原因，标明 full / backward / forward / none。</td></tr>
         <tr><td><strong>⑤ 迁移计划</strong></td><td class="small">工作台「迁移计划」预演 + 结果页「迁移 SQL」分段：有序 ALTER 表 + 回填对象 + 读写方升级顺序 + 阻断项；可下载脚本。</td></tr>
-        <tr><td><strong>⑥ 报表</strong></td><td class="small">工作台「报表与导出」+ 复核页历史对比、SQL 下载、矩阵说明；运行记录落在 data/ 目录可重跑。</td></tr>
+        <tr><td><strong>⑥ 报表</strong></td><td class="small">工作台「报表与导出」+ 复核页发布历史、生效版 SQL 下载、矩阵说明；发布记录落在 data/releases/ 可回看。</td></tr>
       </tbody>
     </table>
   </div>
